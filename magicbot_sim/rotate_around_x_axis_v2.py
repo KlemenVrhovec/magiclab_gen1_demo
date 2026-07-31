@@ -11,14 +11,29 @@ imports rather than repeats. Two things differ, both of them about the SET-DOWN.
    need to. The box is 9 cm square and 20 cm tall, so once tilted past
    atan(0.045/0.100) = 24.2 deg its centre of mass is beyond its bottom corner, and
    setting it down and letting go is enough -- it goes over on its own. Commanding 45
-   carries 32.7, which clears 24.2 with room, and the box still lands square on a new
-   face. Measured, commanding 45:
+   carries about 32.7, and the box does land square on a new face.
 
-       descend    carried    came to rest    face
-        0.18       34.1        0.0 deg       -Z   fell back onto the face it started on
-        0.16       33.0        0.0 deg       -Z   same
-        0.13       32.3       86.1 deg       +X
-        0.11       32.7       89.9 deg       +X   cleanest
+   But clearing 24.2 is necessary, not sufficient: the SET-DOWN can undo it. Every run
+   below carries an identical 32.4-32.8 deg and differs only in how far the pair
+   descends before letting go. The box's underside reaches the table at a descent of
+   0.129, so the right-hand column is how much air is left under it at the release:
+
+       descend    carried    came to rest    face   air at release
+        0.100      32.4        0.0 deg       -Z       29 mm   fell back
+        0.105      32.6        0.0 deg       -Z       24 mm   fell back
+        0.110      32.7       89.9 deg       +X       19 mm   on the edge
+        0.115      32.8       90.0 deg       +X       14 mm
+        0.120      32.6       84.2 deg       +X        9 mm
+        0.130      34.1        0.0 deg       -Z    pressed 1 mm in, levered upright
+        0.160      33.0        0.0 deg       -Z    pressed 31 mm in
+        0.180      34.1        0.0 deg       -Z    pressed 51 mm in
+
+   Drop it from too high and it lands on its corner and bounces square. Press it into the
+   table and the table levers it upright before either hand lets go. The window is a
+   release gap of roughly 9-19 mm and this version aims at the middle of it, because the
+   first attempt aimed at 20 mm and the derived value came out at 0.10999999999999999 --
+   a floating-point hair under the 0.110 boundary, and it fell back. Identical trace to
+   the working run for nineteen simulated seconds, then diverged.
 
 2. THE DESCENT HAS TO BE DERIVED, NOT REUSED. That table is the whole point of this
    version. V1's DESCEND = 0.18 is not a constant of the manoeuvre, it is tuned to V1's
@@ -75,7 +90,14 @@ from rotate_around_x_axis import (
 )
 
 ANGLE = 45.0             # commanded roll; the box carries about 33 of it
-RELEASE_GAP = 0.02       # metres of air left under the box when the hands let go
+
+# Metres of air left under the box when the hands let go. This is the parameter the
+# whole manoeuvre turns on, and it is NOT slack -- see the sweep in the module docstring.
+# Too big and the box is dropped onto its corner from a height, bounces square and lands
+# back on the face it started on. The box's underside reaches the table at a descent of
+# 0.129, so this must stay under about 0.019, and 0.010 sits in the middle of the band
+# that works rather than on its edge.
+RELEASE_GAP = 0.010
 
 # The tilt past which the box's centre of mass clears its bottom corner and it goes over
 # on its own. Everything this script does is in service of clearing this number.
@@ -189,9 +211,15 @@ def main() -> int:
         return 0
 
     log = []
-    simulate(model, data, jm, poses, phases, at["hold"], box, q0, log)
-    carried = box_roll(model, data, q0)[1]
-    peak = simulate(model, data, jm, poses, phases, phases[-1][1] + 2.0, box, q0, log)
+    # The gate is the box's tilt AT THE RELEASE, not at the end of the roll. The set-down
+    # changes it: the table takes the low corner and levers the box a few degrees further
+    # over on the way down (27.1 at the end of the hold becomes 32.7 by the time the first
+    # hand leaves). It is the later number that decides which way it falls.
+    lifted = simulate(model, data, jm, poses, phases, at["descend"], box, q0, log)
+    at_release = box_roll(model, data, q0)[1]
+    peak = max(lifted,
+               simulate(model, data, jm, poses, phases, phases[-1][1] + 2.0,
+                        box, q0, log))
 
     print(f"\n{'t':>5} {'phase':<20} {'box z':>7} {'box roll':>9} {'grip N':>8}"
           f" {'hand contacts':>14}")
@@ -204,9 +232,9 @@ def main() -> int:
     face1, square = down_face(model, data)
 
     print(f"\nbox rose {(max(peak, z0) - z0)*1000:.0f} mm above its start height")
-    print(f"box was rolled {carried:.1f} deg while carried (commanded {args.angle:.0f}, "
-          f"needed {TIP_DEG:.1f} to go over), and came to rest {rolled:.1f} deg from "
-          f"where it started ({total:.1f} deg total rotation)")
+    print(f"box was tilted {at_release:.1f} deg when the hands let go (commanded "
+          f"{args.angle:.0f}, needed {TIP_DEG:.1f} to go over), and came to rest "
+          f"{rolled:.1f} deg from where it started ({total:.1f} deg total rotation)")
     print(f"box settled at z={z_end:.3f} m, table top {TABLE_TOP:.3f} "
           f"-- {'ON THE TABLE' if z_end > TABLE_TOP else 'OFF THE TABLE'}")
     print(f"hand/box contacts at the end: {held_by} "
@@ -214,10 +242,11 @@ def main() -> int:
     print(f"box now rests on its {face1} face (started on {face0}), "
           f"{np.degrees(np.arccos(min(square, 1.0))):.1f} deg off flat")
 
-    turned = abs(carried) >= MIN_ROLL_DEG
+    turned = abs(at_release) >= MIN_ROLL_DEG
     placed = z_end > TABLE_TOP and held_by == 0
     new_face = face1 != face0
-    for label, ok in ((f"carried past the {TIP_DEG:.1f} deg tipping angle", turned),
+    for label, ok in ((f"still past the {TIP_DEG:.1f} deg tipping angle at the release",
+                       turned),
                       ("left on the table, hands clear", placed),
                       ("landed on a new face", new_face)):
         print(f"  [{'x' if ok else ' '}] {label}")
