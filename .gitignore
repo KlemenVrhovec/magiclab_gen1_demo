@@ -24,6 +24,9 @@ ehthumbs.db
 Desktop.ini
 .DS_Store
 
+# Local-only working notes (kept on disk, never pushed)
+claude_code_prompt.md
+
 # MuJoCo / sim output
 *.mp4
 *.png.tmp

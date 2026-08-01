@@ -1,0 +1,11 @@
+# MagicBot Gen1 MuJoCo simulation demo — direct dependencies.
+# Verified on Windows with Python 3.14.6 (native cp314 wheels, no build step).
+#
+#   python -m venv magicbot_sim\.venv
+#   magicbot_sim\.venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# mujoco pulls in absl-py, etils, fsspec, glfw, PyOpenGL, typing_extensions and
+# zipp transitively; those are deliberately left unpinned here.
+
+mujoco==3.11.0
+numpy==2.5.1
