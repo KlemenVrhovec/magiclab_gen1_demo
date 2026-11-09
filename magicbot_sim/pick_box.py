@@ -84,6 +84,39 @@ SQUEEZE = 0.030
 # a held object creep; manipulation tasks normally want 10-100.
 IMPRATIO = 30.0
 
+# --- palm pads ---
+# A flat primitive pad on each palm, so the grasp has a FACE to press with instead of a
+# point. The hand's collision shape is the wrist_pitch_link STL's 611-vertex convex hull,
+# and box-vs-mesh goes through MuJoCo's general convex collider, which yields as little as
+# one contact point per hand -- measured: the left hand holds the box with exactly one
+# point for every step of the lift. A hand on one point transmits force but no torque
+# (condim 3), so it resists no rotation at all and the box will not sit still.
+#
+# A box-vs-box pair uses the special-cased collider instead, which reliably returns a
+# multi-point face contact. So each palm gets a box geom laid flush INTO the flat part of
+# its own hull -- it adds contact points without changing the hand's outline.
+#
+# Geometry, all measured off the hull (see grasp_contact_report.py section 1). The hands
+# are mirror meshes: the left grips with its local -x face, the right with +x, both at
+# |x| = HAND_HALF_THICK. The genuinely flat part of that face is a patch at the palm's
+# LOWER end, spanning y -27..+52 mm and z -130..-108 mm in mesh coordinates.
+# OFF by default: the pads change the carried attitude of the box by ~34 deg, and every
+# set-down constant in rotate_around_x_axis.py and _v2.py is tuned around the attitude
+# WITHOUT them. rotate_around_x_axis_v3.py is the version that turns them on and re-derives
+# the set-down to match; v1 and v2 keep the behaviour their docstrings describe.
+PALM_PADS = False
+# Invisible. The pads are a collision fix, not part of the robot, and drawing them makes
+# it look as though the hand has a part it does not have. Raise the alpha to see them.
+PAD_RGBA = [0.15, 0.80, 0.35, 0.0]
+PAD_CENTRE = np.array([0.0122, -0.1188])    # (y, z) of the flat patch, mesh coordinates
+PAD_HALF_Y = 0.039                          # 78 mm across, the full width of the patch
+PAD_HALF_Z = 0.0155                         # 31 mm tall, kept inside the hull's -134.6 mm
+# Half-thickness. It has to exceed the penetration the squeeze produces (~20 mm) or the
+# pad ends up entirely inside the box, with no surface straddling the box face for the
+# collider to work from. 15 mm of half-thickness puts the pad's inner face 30 mm behind
+# the palm plane, still well inside the hand.
+PAD_HALF_THICK = 0.015
+
 ARM_L = ["left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
          "left_elbow_roll_joint", "left_wrist_yaw_joint", "left_wrist_roll_joint",
          "left_wrist_pitch_joint"]
@@ -94,9 +127,23 @@ PHASES = [("home", 0.0), ("spread", 2.5), ("approach", 5.0), ("close", 6.5),
 IK_PHASES = ("spread", "approach", "close", "lift")
 
 
-def build_model() -> mujoco.MjModel:
-    """Official MJCF + pinned pelvis + a fixed table + a dynamic box."""
+def build_model(palm_pads: bool | None = None, box_half=None,
+                box_y: float = BOX_Y, spec_hook=None) -> mujoco.MjModel:
+    """Official MJCF + pinned pelvis + a fixed table + a dynamic box.
+
+    palm_pads defaults to the PALM_PADS constant; pass True/False to override per script.
+    box_half is the box's (x, y, z) half-extents, default the 9 x 9 x 20 cm block; the box
+    always rests on the tabletop, centred at x = 0, y = box_y. spec_hook(spec), if given,
+    is called on the freshly loaded robot spec before anything is added or compiled --
+    p5_model.py uses it to re-dimension the robot.
+    """
+    if palm_pads is None:
+        palm_pads = PALM_PADS
+    if box_half is None:
+        box_half = [BOX_HALF_XY, BOX_HALF_XY, BOX_HALF_Z]
     spec = mujoco.MjSpec.from_file(str(MJCF))
+    if spec_hook is not None:
+        spec_hook(spec)
 
     # MuJoCo models friction as a soft spring-damper, so a gripped object creeps
     # downward at roughly (its weight / the constraint damping) no matter how hard it is
@@ -128,27 +175,82 @@ def build_model() -> mujoco.MjModel:
     # box: has a freejoint, so it is dynamic
     box = spec.worldbody.add_body()
     box.name = "box"
-    box.pos = [0.0, BOX_Y, BOX_Z]
+    box.pos = [0.0, box_y, TABLE_TOP + box_half[2]]
     box.add_freejoint()
     bg = box.add_geom()
     bg.name = "box_geom"
     bg.type = mujoco.mjtGeom.mjGEOM_BOX
-    bg.size = [BOX_HALF_XY, BOX_HALF_XY, BOX_HALF_Z]
+    bg.size = list(box_half)
     bg.rgba = [0.85, 0.25, 0.20, 1.0]
     bg.mass = BOX_MASS
     bg.contype, bg.conaffinity = 1, 1
     bg.friction = [BOX_FRICTION, 0.02, 0.001]
 
-    return spec.compile()
+    model = spec.compile()
+    if palm_pads:
+        # needs the COMPILED model first -- see add_palm_pads
+        add_palm_pads(spec, model)
+        model = spec.compile()
+    return model
+
+
+def add_palm_pads(spec, model) -> None:
+    """A flat box geom laid into the flat part of each palm's hull. See PALM_PADS.
+
+    The measured patch coordinates are in the hand MESH's frame, and that frame does not
+    exist until the model is compiled: the compiler re-centres mesh vertices and writes
+    the resulting transform into geom_pos/geom_quat. In the spec those are still
+    identity, so placing the pad from spec values silently puts it in BODY coordinates --
+    about 45 mm from where it belongs, close enough to catch the box at the wrong spot and
+    look like it is working. Hence the two-pass compile: read the mesh frame off `model`,
+    then add pads to `spec` and compile again.
+
+    The pad is added AFTER the mesh geom, so it never becomes what hand_geom() returns and
+    every grasp constant (TOUCH_X, GRIP_X, GRASP_Z) keeps its meaning.
+    """
+    for side, sign in (("left", -1.0), ("right", +1.0)):
+        mesh = hand_geom(model, side)
+        rot = np.zeros(9)
+        mujoco.mju_quat2Mat(rot, model.geom_quat[mesh])
+        # the pad's OUTER face sits exactly on the palm plane, so the hand's grasping
+        # surface is where it always was and only the collider changes
+        offset = np.array([sign * (HAND_HALF_THICK - PAD_HALF_THICK),
+                           PAD_CENTRE[0], PAD_CENTRE[1]])
+        pad = spec.body(f"{side}_wrist_pitch_link").add_geom()
+        pad.name = f"{side}_palm_pad"
+        pad.type = mujoco.mjtGeom.mjGEOM_BOX
+        pad.size = [PAD_HALF_THICK, PAD_HALF_Y, PAD_HALF_Z]
+        pad.pos = model.geom_pos[mesh] + rot.reshape(3, 3) @ offset
+        pad.quat = model.geom_quat[mesh]
+        pad.rgba = PAD_RGBA
+        # same pairing as the hand mesh it sits inside: the box's contype meets this
+        pad.contype, pad.conaffinity = 0, 1
+        pad.density = 0.0          # the links carry explicit <inertial>, but be explicit
 
 
 def hand_geom(model, side: str) -> int:
-    """The collision geom on that side's wrist_pitch_link."""
+    """The IK reference geom on that side's wrist_pitch_link -- the hull, not the pad.
+
+    Every grasp target is expressed relative to this geom's centre, so it must stay the
+    hand MESH even when palm pads are enabled. The pads are added after it, so taking the
+    first collidable geom is what keeps that true.
+    """
     b = model.body(f"{side}_wrist_pitch_link").id
     for g in range(model.body_geomadr[b], model.body_geomadr[b] + model.body_geomnum[b]):
         if model.geom_conaffinity[g] or model.geom_contype[g]:
             return g
     raise RuntimeError(f"no collision geom on {side} hand")
+
+
+def hand_collision_geoms(model) -> dict:
+    """{geom id: 'L'/'R'} for every collidable geom on either hand, pads included."""
+    out = {}
+    for side, tag in (("left", "L"), ("right", "R")):
+        b = model.body(f"{side}_wrist_pitch_link").id
+        for g in range(model.body_geomadr[b], model.body_geomadr[b] + model.body_geomnum[b]):
+            if model.geom_conaffinity[g] or model.geom_contype[g]:
+                out[g] = tag
+    return out
 
 
 class JointMap:

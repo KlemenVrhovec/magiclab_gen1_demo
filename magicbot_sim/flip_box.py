@@ -1,0 +1,941 @@
+"""Pick the block up and turn it over, for blocks a push cannot topple.
+
+    python flip_box.py                     # interactive viewer, the default block
+    python flip_box.py --headless          # no window, reports which face ended up down
+    python flip_box.py --shape cube        # tall | block | cube | squat
+    python flip_box.py --sweep-shape       # all four blocks through the same manoeuvre
+    python flip_box.py --sweep-trigger     # how much the set-down threshold matters
+
+WHY NOT JUST PUSH IT OVER. topple_box.py does this without a grasp at all: one palm high
+on the face, one shove, and the block goes over on the table. That is much the easier
+manoeuvre and it should be preferred whenever it applies -- but it only applies to a TALL
+block. A push has to carry the block past atan(a/h) on the arm's own strength, and
+measured, the palm can deliver that for a 120 x 120 x 260 block (tip angle 24.8 deg) and
+nothing squatter: at a 45 deg tip angle the block slides along the table instead of going
+over. Picking it up removes the block's proportions from the problem, because gravity is
+no longer being asked to do the last part of the turn.
+
+WHAT WAS ALREADY HERE, AND WHAT IS ACTUALLY WRONG WITH IT. rotate_around_x_axis.py and its
+v2/v3 already lift and roll. The lift and the roll are fine and this file reuses them
+wholesale -- the IK, the wrist-branch search, the attitude fraction, all of it. It is the
+SET-DOWN that fails, and v3's own sweep says so in the plainest possible terms:
+
+    descend 0.11959010235910551 -> 86.1 deg, +X face   OK
+    descend 0.11960000000000000 ->  0.0 deg, -Z face   FELL BACK
+
+Ten microns. The reason is that every version so far decides where to stop descending
+BEFORE it starts, from a predicted geometry, and then opens the hands there. Both ways of
+being wrong are fatal and they are only millimetres apart -- v2 measured that too:
+
+    release gap 29, 24 mm   too high: dropped on its corner, bounced square, fell back
+    release gap 19..9 mm    works
+    pressed 1 mm in         the table levers the block upright before either hand lets go
+
+THE FIX IS TO STOP GUESSING THE HEIGHT. The pair descends until the block's corner
+actually TOUCHES the table -- read off the contact force, in the loop -- and then stops
+dead and opens the hands. Nothing is predicted, so nothing can be predicted wrongly. The
+block is resting on the table when the hands come off, not falling towards it and not
+being pressed into it, and past its tipping angle a supported block has only one way to
+go. That is the same argument topple_box.py rests on, applied to a block that arrives
+tilted in a pair of hands instead of standing on its base.
+
+--sweep-trigger is the test of that claim, and the result is blunt. Across thresholds from
+0.5 N to 8 N -- a sixteen-fold range, against a block weighing 2.9 N -- the descent freezes
+at the same instant every time, t = 21.03 s, 67.0% of the planned depth, and the block ends
+up on the same face rolled the same 77.6 deg:
+
+    trigger N   froze at   of descent   at release   came to rest   face   result
+          0.5     21.03s        67.0%        56.8d          77.6d     +Y   TURNED
+          8.0     21.03s        67.0%        56.8d          77.6d     +Y   TURNED
+
+Read that carefully, because it proves slightly less than it looks. Identical results mean
+the contact force crosses 0.5 N and 8 N inside a single control step -- the ramp at first
+touch is near vertical -- so what the sweep really establishes is that there is no
+threshold worth tuning, not that the manoeuvre is robust to everything. That is still the
+point: v3's number had to be right to ten microns, and this one cannot be got wrong.
+
+TWO SMALLER THINGS, BOTH MEASURED RATHER THAN INHERITED.
+
+  THE GRIP MOVES TO THE MIDDLE OF THE BLOCK. pick_box.py grips at GRASP_Z = 1.27 with the
+  tabletop at 1.10 and calls it "near the top of the box, so the hand clears the tabletop".
+  It is nothing of the kind. The IK aims the hand GEOM CENTRE, and the palm's only proud
+  surface is a fingertip strip that sits ~117 mm BELOW that centre (measured here by
+  finger_band, borrowed from topple_box.py; the same offset is why pick_box's PAD_CENTRE
+  is at z = -0.1188). So that grasp actually lands 53 mm up a 200 mm block -- about a
+  quarter of the way, not near the top. It is also 18 mm above the lowest point of the
+  hull, so the tabletop clearance it was bought for was never in danger.
+  This file therefore grips at GRIP_FRAC of the block's height, and the default is 0.5,
+  which for a roll is where it wants to be anyway: the pinch axis then runs through the
+  centre of mass and the two palms make a clean couple instead of a couple plus a moment.
+
+  THE TABLE HEIGHT IS DERIVED FROM THE BLOCK, NOT FIXED. Once the grip is a fraction of
+  the way up the block, a shorter block needs a higher table to put the hand in the same
+  place. The arm has one band it works well in, so pin the hand there and solve for the
+  table instead:
+
+      table_top = HAND_Z - strip_offset - GRIP_FRAC * block height
+
+  For the original 90 x 90 x 200 block that returns 1.10, which is what pick_box.py uses.
+  It is the same number, arrived at from the constraint that produced it, so it now
+  follows the block instead of having to be retuned by hand for each one.
+
+WHAT IS NOT CLAIMED. The roll is still the one v1 measured: about 65 deg carried out of 90
+commanded, because right wrist_roll runs out of travel (rotate_around_x_axis.py documents
+the branch search that failed to find more). So this turns a block whose tipping angle is
+under ~65 deg, which covers everything from a slab to a block half as tall as it is wide,
+and does not cover a plate. --sweep-shape reports the carried roll and the tipping angle
+side by side for four blocks, so where the method runs out is visible rather than asserted.
+"""
+
+import argparse
+import time
+
+import mujoco
+import mujoco.viewer
+import numpy as np
+
+import pick_box
+from pick_box import (
+    ARM_L,
+    ARM_R,
+    HAND_HALF_THICK,
+    IMPRATIO,
+    PELVIS_H,
+    SPREAD_X,
+    SPREAD_Y,
+    SPREAD_Z,
+    SQUEEZE,
+    JointMap,
+    control,
+    grip_force,
+    hand_collision_geoms,
+)
+from pick_box_v2 import GRASP_RAISE, PREROLL_DEG, SPREAD_FRAC, home_hand
+from rotate_around_x_axis import (
+    ATTITUDE_FRAC,
+    RELEASE,
+    WaistArms,
+    add_squeeze,
+    box_roll,
+    down_face,
+    grasp_attitude,
+    rot_y,
+    solve_branch,
+    solve_to,
+)
+# finger_band measures the palm's proud fingertip strip off the hull. It is a property of
+# the robot, not of either manoeuvre, so it is taken from the file that first needed it.
+from topple_box import FACE_RGBA, finger_band
+
+# --- the blocks -------------------------------------------------------------------
+# (half-width, half-height). The tipping angle atan(a/h) is what decides whether a push
+# could have done the job instead; it is printed everywhere below.
+SHAPES = {
+    "tall":  np.array([0.045, 0.100]),     # 90 x 90 x 200  -- pick_box.py's original
+    "block": np.array([0.060, 0.130]),     # 120 x 120 x 260 -- topple_box.py's
+    "cube":  np.array([0.060, 0.060]),     # 120 cube        -- tips at 45 deg
+    "wide":  np.array([0.070, 0.070]),     # 140 cube        -- tips at 45, but wider
+    "low":   np.array([0.060, 0.050]),     # 120 x 120 x 100 -- tips at 50.2 deg
+    "squat": np.array([0.070, 0.050]),     # 140 x 140 x 100 -- tips at 54.5 deg
+}
+BOX_MASS = 0.30
+BOX_FRICTION = 2.0
+BOX_Y = -0.36
+
+# --- where the hand wants to be ----------------------------------------------------
+# The band the arm works in, and the fraction of the block's height the fingertip strip
+# is placed at. Between them these fix the table height -- see table_for().
+HAND_Z = 1.25
+GRIP_FRAC = 0.50
+TABLE_Y = -0.45
+TABLE_HALF_XY = np.array([0.32, 0.16])
+
+# --- the lift ---------------------------------------------------------------------
+# How far the pair raises the block before rolling it. pick_box.LIFT_H is 0.15, and every
+# millimetre of it has to be given back through the descent -- during which the block is
+# steadily rotating back inside the grasp, because the palms are following only half the
+# roll and their contact patch is sliding. So the lift is not free and it is not inherited:
+# it only has to clear the table for the block's corner to swing under it during the roll,
+# which is (half-diagonal - half-height), about 25 mm for a cube.
+LIFT_H = 0.08
+
+# --- the roll ---------------------------------------------------------------------
+# Commanded roll. rotate_around_x_axis.py commands 90 on the reasoning that the wrists give
+# up part of it, so ask for more than you want. On this file's mid-height grip that is no
+# longer true and it overshoots badly: commanding 90 CARRIES 106-127 deg, because the
+# block rotates further inside the palms than the palms themselves orbit. Turning the block
+# a long way over in mid-air is exactly what this does not need to do -- everything past
+# the tipping angle is gravity's job once the block is back on the table -- so command the
+# angle actually wanted and let the set-down finish it. What is carried is still measured
+# and printed, never assumed.
+# 75, not 50. 50 was asked for to stop the block being flung right over in mid-air, and it
+# was the right diagnosis -- the old 90 was CARRYING 106-127 deg. But the angle needed is a
+# property of the block, not a preference: the block has to still be past atan(a/h) at the
+# instant the hands let go, and for the default cube that is 45 deg. 50 leaves 5 deg of
+# margin, the roll bleeds inside the palms on the way down, and it arrives at 0. 75 lands
+# it at 89.2. A tall block, tipping at 24.8 deg, turns over happily on 50.
+ROLL_DEG = 75.0
+ROLL_STEPS = 6
+ROLL_SECS = 6.0
+HOLD_SECS = 2.0
+
+# --- the set-down -----------------------------------------------------------------
+# Newtons of block-on-table contact force that stops the descent. The block weighs about
+# 3 N, so 2.0 means "the table is now carrying a serious fraction of it" -- late enough
+# not to trip on solver noise, early enough that the hands are not pressing it down.
+# --sweep-trigger runs 0.5 to 8.0.
+TRIGGER_N = 2.0
+# m/s. The descent is the delicate part -- it is where the block is lowered onto its own
+# corner -- so it is taken slowly, and slowly is also what gives the contact trigger the
+# least overshoot to stop. It is not free: the block rotates back inside the grasp for the
+# whole descent (measured at 36-74 deg on the 140 cube), so a slower descent spends more
+# roll. --sweep-speed reports both sides of that trade.
+DESCEND_SPEED = 0.02
+DESCEND_MARGIN = 0.05    # metres of descent planned BEYOND first contact, as headroom
+# OPEN THE HANDS BEFORE WITHDRAWING THEM. Every earlier version goes straight from a
+# squeezing grip to a 100 mm sideways retraction, which drags the block by friction at the
+# worst possible moment. Traced on the 90x90x200 block: set down at 31.5 deg -- comfortably
+# past its 24.8 deg tipping angle -- and then the retracting palm, still pressing at 65 N,
+# pulled it back off the table (table force 4.9 N -> 0.0) and it righted itself. So the
+# palms first back off symmetrically by enough to zero the grip, and only then withdraw.
+# That is also the moment the block is genuinely let go: standing on its own edge, on the
+# table, past its tipping angle, with nothing touching it.
+# The gap has to clear the 30 mm squeeze bias AND the 18 mm the grip is commanded inside
+# the block's face (GRIP_X), hence 50 rather than 30.
+# Extra roll commanded THROUGH the descent, on top of ROLL_DEG. This is not more turn in
+# the air -- it is the opposite. Measured on the 120x120x260 block: the roll reaches its
+# commanded 50 deg at the top of the descent, then BLEEDS back to 31.5 by the time the
+# block is on the table and to 24.0 by the time the hands open, against a 24.8 deg tipping
+# angle. It arrives half a degree short having been right for the whole manoeuvre. The
+# block is rotating back inside the palms under its own weight for the entire descent, and
+# the slower the descent the more of it is lost. So the hands keep rolling as they lower,
+# which HOLDS the block at the angle it was turned to instead of letting it unwind.
+# Feed-forward for a known, one-directional loss; what the block actually does is measured.
+DESCEND_ROLL_HOLD = 25.0
+
+# THE RIGHT HAND DOES NOT MOVE. Only the left is withdrawn, and only along X. Everything
+# that has gone wrong at the release has been one hand disturbing the block while the other
+# was supposed to be letting go of it -- the squeeze coming off both arms at once, the
+# shared waist swinging the far arm, the palm coming out 14 mm high and carrying the block
+# up with it. The narrowest possible version of the manoeuvre removes all of those at once:
+# one arm moves, in one direction, and the other is simply left standing where it set the
+# block down. 'settle' after it commands nothing at all -- it is dwell, so the block goes
+# over under its own weight with nothing being asked of either arm.
+RELEASE_PHASES = ("open_left", "settle", "clear")
+SETTLE_SECS = 2.5
+RELEASE_SECS = 1.5       # per hand; the two come off one after the other
+CLEAR_SECS = 2.0
+
+LEAD_IN = [("home", 0.0), ("spread", 2.5), ("approach", 5.0), ("close", 6.5),
+           ("lift", 9.0)]
+GRIPPING = ("close", "lift", "hold", "descend")
+
+
+def tip_deg(half) -> float:
+    """Tilt past which the block's centre of mass clears the edge it is turning about."""
+    return float(np.degrees(np.arctan(half[0] / half[1])))
+
+
+def table_for(half, strip_drop) -> float:
+    """Tabletop height that puts the fingertip strip GRIP_FRAC of the way up this block.
+
+    The arm has one height it works well at, and the block's proportions are the thing
+    being varied, so the table is what gives. See the module docstring.
+    """
+    return HAND_Z + strip_drop - GRIP_FRAC * 2.0 * half[1]
+
+
+def strip_drop_of(model) -> float:
+    """Signed offset of the fingertip strip below the hand geom's frame, in metres."""
+    lo, hi = finger_band(model, "left")
+    return 0.5 * (lo + hi)
+
+
+def build_scene(table_top, half, pads=True) -> mujoco.MjModel:
+    """pick_box.build_model's scene with the table height and the block as parameters.
+
+    Palm pads default ON here, unlike pick_box.py. rotate_around_x_axis_v3.py measured
+    what they buy: contact points per hand go from 1.0/1.5 to 5.0/5.0 through the lift and
+    uncommanded tilt from 1.25 deg rms to 0.32, because a box-vs-box pair uses MuJoCo's
+    special-cased collider instead of the general convex one. A grasp that has to survive
+    a 65 deg roll and then be opened deliberately wants that.
+    """
+    spec = mujoco.MjSpec.from_file(str(pick_box.MJCF))
+    spec.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
+    spec.option.impratio = IMPRATIO
+
+    pelvis = spec.body("pelvis")
+    spec.delete(pelvis.joints[0])
+    pelvis.pos = [0.0, 0.0, PELVIS_H]
+
+    table = spec.worldbody.add_body()
+    table.name = "table"
+    table.pos = [0.0, TABLE_Y, table_top / 2.0]
+    tg = table.add_geom()
+    tg.name = "table_geom"
+    tg.type = mujoco.mjtGeom.mjGEOM_BOX
+    tg.size = [TABLE_HALF_XY[0], TABLE_HALF_XY[1], table_top / 2.0]
+    tg.rgba = [0.55, 0.42, 0.30, 1.0]
+    tg.contype, tg.conaffinity = 1, 1
+
+    box = spec.worldbody.add_body()
+    box.name = "box"
+    box.pos = [0.0, BOX_Y, table_top + half[1]]
+    box.add_freejoint()
+    bg = box.add_geom()
+    bg.name = "box_geom"
+    bg.type = mujoco.mjtGeom.mjGEOM_BOX
+    bg.size = [half[0], half[0], half[1]]
+    bg.rgba = FACE_RGBA[5]
+    bg.mass = BOX_MASS
+    bg.contype, bg.conaffinity = 1, 1
+    bg.friction = [BOX_FRICTION, 0.02, 0.001]
+
+    # one thin coloured plate per face, no collision and no mass -- so which face is down
+    # is visible in the viewer instead of only in the printout
+    size3 = np.array([half[0], half[0], half[1]])
+    for i, (axis, sign) in enumerate([(a, s) for a in range(3) for s in (-1, 1)]):
+        size = size3 * 0.92
+        size[axis] = 0.002
+        pos = np.zeros(3)
+        pos[axis] = sign * size3[axis]
+        d = box.add_geom()
+        d.name = f"face_{'xyz'[axis]}{'-+'[sign > 0]}"
+        d.type = mujoco.mjtGeom.mjGEOM_BOX
+        d.size = list(size)
+        d.pos = list(pos)
+        d.rgba = FACE_RGBA[i]
+        d.contype, d.conaffinity = 0, 0
+        d.density = 0.0
+
+    model = spec.compile()
+    if pads:
+        pick_box.add_palm_pads(spec, model)
+        model = spec.compile()
+    return model
+
+
+class Grasp:
+    """The block-dependent grasp geometry, in one place.
+
+    pick_box.py hard-codes TOUCH_X/OPEN_X/GRIP_X/GRASP_Z as module constants derived from
+    one block, and rotate_around_x_axis.py imports them. Turning a different block means
+    every one of them moves, so they become fields here instead.
+    """
+
+    def __init__(self, model, half, table_top, lift=LIFT_H):
+        self.half = half
+        self.table_top = table_top
+        self.lift = lift
+        self.drop = strip_drop_of(model)
+        self.touch_x = half[0] + HAND_HALF_THICK
+        self.open_x = self.touch_x + 0.075
+        self.grip_x = self.touch_x - 0.018
+        # geom-centre height that puts the fingertip strip GRIP_FRAC up the block
+        self.geom_z = table_top + GRIP_FRAC * 2.0 * half[1] - self.drop
+        self.centre_z = table_top + half[1]          # the block's own centre
+        self.corners = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1)
+                                 for sz in (-1, 1)], float) * [half[0], half[0], half[1]]
+
+    def lowest_corner(self, data, box) -> float:
+        """World z of the block's lowest corner. Measured, not predicted from the tilt.
+
+        v2 predicts this as hx*|sin t| + hz*|cos t|, which is exact only for a pure roll
+        about Y; the palm pads alone put ~34 deg of fore-aft lean on the block that that
+        formula cannot see. Eight corners through the block's own rotation matrix costs
+        nothing and assumes nothing.
+        """
+        R = data.xmat[box].reshape(3, 3)
+        return float((data.xpos[box] + self.corners @ R.T)[:, 2].min())
+
+
+def hand_targets(phase, g, spread_pt, roll=0.0, drop=0.0, open_l=0.0, open_r=0.0):
+    """World targets for the two hand geom centres (left, right).
+
+    Same construction as rotate_around_x_axis.hand_targets -- the +/-X offset between the
+    palms is carried round by Ry(roll) so the pair orbits the block -- with the constants
+    taken from `g` instead of from pick_box's module scope. The orbit centre is the
+    block's centre of mass rather than the hand height, which is what GRIP_FRAC = 0.5
+    makes possible: the pinch axis passes through the CoM and the palms make a clean
+    couple.
+    """
+    if phase == "spread":
+        return (np.array(spread_pt), np.array([-spread_pt[0], spread_pt[1], spread_pt[2]]))
+    if phase == "approach":
+        centre = np.array([0.0, BOX_Y, g.geom_z + GRASP_RAISE])
+        return centre + [g.open_x, 0, 0], centre - [g.open_x, 0, 0]
+    rise = g.lift if phase != "close" else 0.0
+    centre = np.array([0.0, BOX_Y, g.geom_z + GRASP_RAISE + rise - drop])
+    off = rot_y(roll) @ np.array([g.grip_x, 0.0, 0.0])
+    out = np.array([1.0, 0.0, 0.0])
+    return centre + off + open_l * out, centre - off - open_r * out
+
+
+def timeline(total_deg, steps, secs, descend, release, speed=DESCEND_SPEED):
+    """(phases, per-phase (roll, drop, left retract, right retract)).
+
+    RELEASE ORDER: the LEFT palm comes off first, then the right, which is
+    rotate_around_x_axis.py's order. A version of this file tried the reverse and it was
+    visibly worse in the viewer -- taking the right hand off first nudged the block just as
+    it was left standing on its own edge. That turned out not to be about the order at all:
+    the release offsets were moving BOTH arms, so the still-gripping palm backed off the
+    block whenever the other one moved. arm_mask() in SetDown is the fix; the left-first
+    order is kept because it is the one that was watched and worked.
+    """
+    phases = list(LEAD_IN)
+    sched = {name: (0.0, 0.0, 0.0, 0.0) for name, _ in phases}
+    t0 = phases[-1][1]
+    for i in range(1, steps + 1):
+        name = f"roll{i}"
+        phases.append((name, t0 + secs * i / steps))
+        sched[name] = (np.deg2rad(total_deg * i / steps), 0.0, 0.0, 0.0)
+
+    r = sched[phases[-1][0]][0]
+    rd = r + np.deg2rad(DESCEND_ROLL_HOLD)
+    # the descent is paced by speed, not by a fixed number of seconds: it is planned to
+    # overshoot first contact by DESCEND_MARGIN and the trigger is expected to stop it
+    # partway, so a fixed duration would change the approach speed with the block
+    for name, dt, entry in (
+            ("hold", HOLD_SECS, (r, 0.0, 0.0, 0.0)),
+            ("descend", max(descend, 1e-3) / speed, (rd, descend, 0.0, 0.0)),
+            ("open_left", RELEASE_SECS, (rd, descend, release, 0.0)),
+            ("settle", SETTLE_SECS, (rd, descend, release, 0.0)),
+            ("clear", CLEAR_SECS, (rd, descend - 0.06, 2.0 * release, 2.0 * release))):
+        phases.append((name, phases[-1][1] + dt))
+        sched[name] = entry
+    return phases, sched
+
+
+def plan(model, jm, g, phases, sched, squeeze=SQUEEZE, preroll_deg=PREROLL_DEG,
+         frac=ATTITUDE_FRAC, verbose=True) -> dict:
+    """Solve IK once per waypoint, warm-started along the sweep.
+
+    rotate_around_x_axis.plan with `g` threaded through hand_targets. The wrist-branch
+    search at 'close', the elbow and continuity null-space terms and the attitude fraction
+    are all its work and are used unchanged -- see that file for what each one is for and
+    for the measurements behind ATTITUDE_FRAC = 0.5.
+    """
+    scratch = mujoco.MjData(model)
+    arms = WaistArms(model, True)
+
+    home = np.zeros(model.nu)
+    home[jm.index("left_shoulder_roll_joint")] = 0.25
+    home[jm.index("right_shoulder_roll_joint")] = -0.25
+
+    full = np.array([SPREAD_X, SPREAD_Y, SPREAD_Z])
+    h0 = home_hand(model, jm, home)
+    spread_pt = h0 + SPREAD_FRAC * (full - h0)
+
+    poses = {"home": home}
+    seed = np.zeros(len(arms.names))
+    seed[-14:] = np.deg2rad([-20, 70, -20, -40, 0, 0, 0, -20, -70, 20, 40, 0, 0, 0])
+    if verbose:
+        print(f"  {'waypoint':<10} {'roll':>6} {'pos err L/R (mm)':>18}")
+    for name, _ in phases[1:]:
+        # 'hold' is a copy of the last roll waypoint; the withdrawal poses are built at
+        # runtime by SetDown from the pose the block was actually set down in, so solving
+        # IK for them here would only produce values that are then discarded.
+        if name == "hold" or name in RELEASE_PHASES:
+            continue
+        r, drop, ol, orr = sched[name]
+        tl, tr = hand_targets(name, g, spread_pt, r, drop, ol, orr)
+        R = grasp_attitude(r, preroll_deg if name not in ("spread", "approach") else 0.0,
+                           frac)
+        if name == "close":
+            q, el, er, label = solve_branch(arms, model, jm, home, tl, tr, R, seed,
+                                            verbose=False)
+        else:
+            mujoco.mj_resetData(model, scratch)
+            scratch.qpos[jm.qadr] = home
+            scratch.qpos[arms.qids] = np.clip(seed, arms.lo, arms.hi)
+            q, el, er = solve_to(arms, scratch, tl, tr, R, q_ref=seed)
+
+        full_pose = home.copy()
+        for n, v in zip(arms.names, q):
+            full_pose[jm.index(n)] = v
+        poses[name] = full_pose
+        seed = q
+        if verbose:
+            print(f"  {name:<10} {np.degrees(r):5.0f}d {el * 1000:8.1f} {er * 1000:8.1f}")
+
+    poses["hold"] = poses[f"roll{ROLL_STEPS}"]
+    for name in RELEASE_PHASES:
+        poses[name] = poses["descend"]      # placeholders; replaced at the freeze
+    if squeeze > 0:
+        for name in list(poses):
+            if name in GRIPPING or name.startswith("roll"):
+                poses[name] = add_squeeze(model, jm, arms, poses[name], squeeze,
+                                          sched[name][0], frac)
+    return poses
+
+
+ARM_JOINTS = {"left": ARM_L, "right": ARM_R}
+
+
+def slide_out(model, jm, pose, sides, distance, steps=8):
+    """Slide the named palm(s) STRAIGHT OUT along world X. z, y and attitude unchanged.
+
+    This is what withdrawing from the block has to be, and what none of the earlier
+    versions actually did. They plan a retracted waypoint with the full IK -- waist
+    included -- and interpolate the joint vector towards it. Two things go wrong. The
+    waist is shared, so retracting one hand swings the torso and drags the other arm with
+    it; and the interpolation is applied on top of whatever pose the contact trigger froze
+    the descent in, which is not the pose the waypoint was planned from, so the real
+    Cartesian path is not the planned one. Traced on the 90x90x200 block, the palm came
+    out 14 mm HIGH and carried the block up off the table by friction (table force
+    4.3 N -> 0.0), and the block -- already set down past its tipping angle -- stood back
+    up. The whole manoeuvre was lost in the last second of it.
+
+    So the retraction is built here instead, as a Jacobian step per palm using ONLY that
+    arm's seven joints: the target velocity is (+/-x, 0, 0) with zero rotation, so the
+    hand's height and its attitude are both constraints rather than outcomes, and the
+    other arm and the waist cannot move because their columns are not in the system.
+    Same construction as pick_box.add_squeeze, which biases the grip the same way.
+
+    `sides` is a list of "left"/"right"; passing both moves both, independently.
+    """
+    out = pose.copy()
+    scratch = mujoco.MjData(model)
+    plan_ = []
+    for side in sides:
+        names = ARM_JOINTS[side]
+        plan_.append((
+            [model.jnt_qposadr[model.joint(n).id] for n in names],
+            [model.jnt_dofadr[model.joint(n).id] for n in names],
+            np.array([model.jnt_range[model.joint(n).id, 0] for n in names]),
+            np.array([model.jnt_range[model.joint(n).id, 1] for n in names]),
+            [jm.index(n) for n in names],
+            model.body(f"{side}_wrist_pitch_link").id,
+            pick_box.hand_geom(model, side),
+            1.0 if side == "left" else -1.0,
+        ))
+    for _ in range(steps):
+        scratch.qpos[jm.qadr] = out
+        mujoco.mj_forward(model, scratch)
+        for qids, dofs, lo, hi, idx, body, geom, sign in plan_:
+            jp = np.zeros((3, model.nv))
+            jr = np.zeros((3, model.nv))
+            mujoco.mj_jac(model, scratch, jp, jr, scratch.geom_xpos[geom].copy(), body)
+            J = np.vstack([jp[:, dofs], jr[:, dofs]])
+            # dy and dz are ZERO, and so are all three rotation rows: the palm may only
+            # travel along world X, at the height and attitude it was set down at
+            e = np.concatenate([[sign * distance / steps, 0.0, 0.0], np.zeros(3)])
+            dq = J.T @ np.linalg.solve(J @ J.T + 0.05**2 * np.eye(6), e)
+            out[idx] = np.clip(scratch.qpos[qids] + dq, lo, hi)
+    return out
+
+
+class SetDown:
+    """Time-based interpolation everywhere except the descent, which stops on contact.
+
+    This is the whole point of the file. Every earlier version interpolates the descent to
+    a planned depth and opens the hands there, which makes the outcome a function of a
+    number chosen before the run -- and v3 measured that function changing sign over ten
+    microns. Here the descent advances with time only until the block's own weight starts
+    landing on the table; from that instant the base pose is frozen and the release runs
+    as a joint-space offset on top of whatever pose the block was actually set down in.
+
+    The release offsets are taken from the plan at the planned depth. They are palm
+    retractions of ~100 mm sideways and the freeze happens within DESCEND_MARGIN of the
+    planned depth, so applying them at the frozen pose is a small extrapolation; what the
+    palms actually retract is measured and reported rather than assumed.
+    """
+
+    def __init__(self, poses, phases, jm, model, trigger_n=TRIGGER_N):
+        self.poses, self.phases, self.trigger = poses, phases, trigger_n
+        self.jm, self.model = jm, model
+        self.at = dict(phases)
+        self.frozen = None            # interpolation fraction at which contact was seen
+        self.frozen_at = None         # simulation time it happened
+        self.release = None           # built at the freeze, from the pose actually reached
+        # Everything after the descent is a chain of joint-space offsets applied on top of
+        # the frozen pose, built from the phase list in the order the phases actually
+        # occur. Naming the hands here instead would silently keep the old release order
+        # when timeline() changes it.
+        #
+        # ONE HAND AT A TIME MEANS ONE ARM AT A TIME. Each offset is masked down to the
+        # joints of the arm that is actually retracting. Without the mask, watching the
+        # viewer shows the still-gripping palm visibly backing off the block the moment the
+        # OTHER hand starts to move, and the block is nudged just as it is left standing on
+        # its own edge. Two separate couplings cause that and the mask cuts both:
+        #   * the squeeze bias is applied only to the GRIPPING phases, so the difference
+        #     between 'descend' and the first release waypoint removes ~30 mm of inward
+        #     over-travel from BOTH arms, not just the one letting go;
+        #   * the waist joints are in the IK chain (WaistArms), so re-solving for one hand's
+        #     new target moves the torso, and the other arm rides along with it.
+        # rotate_around_x_axis.py has the same two couplings and no mask; its docstring only
+        # notes the first one, as a reason not to command a retracting hand into the box.
+        names = [n for n, _ in phases]
+        self.order = names[names.index("descend") + 1:]
+
+    def _build_release(self, base):
+        """The withdrawal poses, measured out from the pose the block was actually set in.
+
+        ONE ARM MOVES. slide_out is given only "left", so the right arm's seven joints are
+        never in the system and it cannot move at all -- it holds the pose it set the block
+        down in, squeeze included. The left palm's y and z and all three rotation rows are
+        pinned, so the single thing that happens here is that palm travelling sideways off
+        the block's face.
+
+        'settle' is the same pose as 'open_left': nothing is commanded, the block is left
+        to go over on its own. 'clear' only runs after that dwell, when there is nothing
+        left to disturb, and is the first and only time the right arm moves.
+        """
+        m, jm = self.model, self.jm
+        left = slide_out(m, jm, base, ["left"], RELEASE)
+        clear = slide_out(m, jm, left, ["left", "right"], RELEASE)
+        return {"open_left": left, "settle": left, "clear": clear}
+
+    @staticmethod
+    def _ease(s):
+        return 0.5 - 0.5 * np.cos(np.pi * np.clip(s, 0.0, 1.0))
+
+    def note_contact(self, force, t, s):
+        if self.frozen is None and force >= self.trigger:
+            self.frozen, self.frozen_at = s, t
+
+    def base(self, t):
+        """The descend interpolation fraction in force at time t."""
+        s = self._ease((t - self.at["hold"]) / (self.at["descend"] - self.at["hold"]))
+        if self.frozen is not None:
+            s = min(s, self.frozen)
+        return s
+
+    def target(self, t, model=None, data=None):
+        p, ph = self.poses, self.phases
+        if t <= ph[0][1]:
+            return p[ph[0][0]], ph[0][0]
+        if t < self.at["hold"]:
+            for (n0, t0), (n1, t1) in zip(ph, ph[1:]):
+                if t < t1:
+                    s = self._ease((t - t0) / (t1 - t0))
+                    return p[n0] * (1 - s) + p[n1] * s, f"{n0}->{n1}"
+        s = self.base(t)
+        pose = p["hold"] * (1 - s) + p["descend"] * s
+        phase = "descend" if self.frozen is None else "set down"
+        if t < self.at["descend"]:
+            return pose, phase
+        # The withdrawal is built once, from the pose the descent actually stopped in --
+        # not from the plan. If the trigger never fired, that is the fully descended pose,
+        # which is the same thing.
+        if self.release is None:
+            self.release = self._build_release(pose)
+        prev_t = self.at["descend"]
+        prev_pose = pose
+        for name in self.order:
+            a = self._ease((t - prev_t) / (self.at[name] - prev_t))
+            if a <= 0:
+                break
+            pose = prev_pose * (1 - a) + self.release[name] * a
+            phase = name
+            prev_t, prev_pose = self.at[name], self.release[name]
+        return pose, phase
+
+
+def table_force(model, data) -> float:
+    """Normal force the TABLE is pushing up on the block with -- the set-down trigger."""
+    bg, tg = model.geom("box_geom").id, model.geom("table_geom").id
+    total = 0.0
+    for i in range(data.ncon):
+        c = data.contact[i]
+        if bg in (c.geom1, c.geom2) and tg in (c.geom1, c.geom2):
+            f = np.zeros(6)
+            mujoco.mj_contactForce(model, data, i, f)
+            total += abs(f[0])
+    return total
+
+
+def box_contacts(model, data, hands) -> int:
+    bg = model.geom("box_geom").id
+    n = 0
+    for i in range(data.ncon):
+        c = data.contact[i]
+        if bg in (c.geom1, c.geom2):
+            if hands.get(c.geom2 if c.geom1 == bg else c.geom1) is not None:
+                n += 1
+    return n
+
+
+def carry_to_hold(model, jm, g, poses, phases):
+    """Run to the end of the hold and measure where the block's lowest corner ended up.
+
+    Two passes, as in v3: the carried attitude is emergent, so how far there is to descend
+    cannot be known until the block has actually been rolled. The difference is what the
+    number is used for -- v3 subtracts a release gap from it and commits, this only uses it
+    to size the descent that the contact trigger will interrupt.
+    """
+    box = model.body("box").id
+    data = mujoco.MjData(model)
+    data.qpos[jm.qadr] = poses["home"]
+    mujoco.mj_forward(model, data)
+    q0 = data.xquat[box].copy()
+    at = dict(phases)
+    sd = SetDown(poses, phases, jm, model)
+    while data.time < at["hold"]:
+        tgt, _ = sd.target(data.time)
+        control(model, data, jm, tgt)
+        mujoco.mj_step(model, data)
+    return g.lowest_corner(data, box) - g.table_top, box_roll(model, data, q0)[1]
+
+
+def run_once(model, jm, g, poses, phases, trigger_n, log=None) -> dict:
+    box = model.body("box").id
+    hands = hand_collision_geoms(model)
+    data = mujoco.MjData(model)
+    data.qpos[jm.qadr] = poses["home"]
+    mujoco.mj_forward(model, data)
+    q0 = data.xquat[box].copy()
+    face0, _ = down_face(model, data)
+    z0 = data.xpos[box][2]
+
+    sd = SetDown(poses, phases, jm, model, trigger_n)
+    at = dict(phases)
+    peak, nxt, roll_at_release = z0, 0.0, None
+    # The block must still be IN THE HANDS right up to the moment the first palm is told
+    # to retract. Without this check a run that DROPS the block during the roll can still
+    # report every box ticked -- it lands on a new face, flat, on the table, with the hands
+    # clear -- and the contact trigger then fires at 0% of the descent because the block is
+    # already down. That is not a set-down, it is a fall that happened to land well.
+    first_release = sd.order[0]
+    lost_grip = False
+    end = phases[-1][1] + 2.0
+    while data.time < end:
+        tgt, phase = sd.target(data.time)
+        control(model, data, jm, tgt)
+        mujoco.mj_step(model, data)
+        peak = max(peak, data.xpos[box][2])
+        # up to the moment the withdrawal STARTS -- which is the end of the descent, not
+        # the end of the first release phase. Running the window to the end of open_left
+        # counts the withdrawal itself as a dropped block: contact is meant to reach zero
+        # there, and it flagged an otherwise clean run.
+        if at["lift"] <= data.time < at["descend"]:
+            if box_contacts(model, data, hands) == 0:
+                lost_grip = True
+        if data.time >= at["hold"]:
+            sd.note_contact(table_force(model, data), data.time, sd.base(data.time))
+        # "at the release" = the moment the withdrawing palm has finished coming off, which
+        # is the end of the first release phase whatever that phase is called
+        if roll_at_release is None and data.time >= at[first_release]:
+            roll_at_release = box_roll(model, data, q0)[1]
+        if log is not None and data.time >= nxt:
+            nxt += 1.0
+            log.append((data.time, phase, data.xpos[box][2], box_roll(model, data, q0)[1],
+                        grip_force(model, data), table_force(model, data),
+                        box_contacts(model, data, hands)))
+
+    face1, square = down_face(model, data)
+    total, rolled = box_roll(model, data, q0)
+    return dict(face0=face0, face1=face1, square=square, peak=peak, z0=z0,
+                rolled=rolled, total=total, z_end=float(data.xpos[box][2]),
+                held=box_contacts(model, data, hands),
+                at_release=roll_at_release if roll_at_release is not None else 0.0,
+                lost_grip=lost_grip,
+                froze=sd.frozen is not None, froze_at=sd.frozen_at,
+                froze_frac=sd.frozen if sd.frozen is not None else 1.0)
+
+
+def verdict(r, table_top) -> bool:
+    """Turned onto a new face, lying flat, left on the table -- AND actually set down.
+
+    r["lost_grip"] is the difference between placing the block and dropping it somewhere
+    lucky. Both look identical in every other field.
+    """
+    return (r["face1"] != r["face0"] and r["z_end"] > table_top and r["held"] == 0
+            and r["square"] > 0.999 and not r.get("lost_grip", False))
+
+
+def build_and_run(shape="cube", trigger_n=TRIGGER_N, lift=LIFT_H, roll=ROLL_DEG,
+                  speed=DESCEND_SPEED, frac=ATTITUDE_FRAC, verbose=False, log=None):
+    """One complete trial: size the table to the block, plan, carry, set down, release."""
+    half = SHAPES[shape]
+    probe = build_scene(1.10, half)                 # only to measure the fingertip strip
+    table_top = table_for(half, strip_drop_of(probe))
+    model = build_scene(table_top, half)
+    jm = JointMap(model)
+    g = Grasp(model, half, table_top, lift)
+
+    # pass 1: how far is there to descend, once the block has actually been rolled
+    ph0, sc0 = timeline(roll, ROLL_STEPS, ROLL_SECS, 0.0, RELEASE, speed)
+    poses0 = plan(model, jm, g, ph0, sc0, frac=frac, verbose=verbose)
+    gap, carried = carry_to_hold(model, jm, g, poses0, ph0)
+
+    # A negative gap means the block's lowest corner finished BELOW the tabletop, which on
+    # this scene can only mean it was dropped during the roll and is on the floor. Say so
+    # instead of planning a descent from a nonsense number -- an earlier version clamped it
+    # to 20 mm and went on to report a confident-looking failure with the wrong cause.
+    if gap < 0.0:
+        return dict(dropped=True, half=half, table_top=table_top, gap=gap,
+                    carried=carried, descend=0.0, face0="-Z", face1="-Z", square=1.0,
+                    peak=0.0, z0=0.0, rolled=0.0, total=0.0, z_end=0.0, held=0,
+                    at_release=0.0, froze=False, froze_at=None, froze_frac=0.0,
+                    lost_grip=True,
+                    model=model, jm=jm, poses=poses0, phases=ph0, grasp=g)
+
+    # pass 2: the same manoeuvre, with a descent planned to overshoot contact
+    descend = max(gap + DESCEND_MARGIN, 0.02)
+    phases, sched = timeline(roll, ROLL_STEPS, ROLL_SECS, descend, RELEASE, speed)
+    poses = plan(model, jm, g, phases, sched, frac=frac, verbose=verbose)
+    r = run_once(model, jm, g, poses, phases, trigger_n, log)
+    r.update(dropped=False, half=half, table_top=table_top, gap=gap, carried=carried,
+             descend=descend, model=model, jm=jm, poses=poses, phases=phases, grasp=g)
+    return r
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--headless", action="store_true", help="no window; report the outcome")
+    ap.add_argument("--shape", default="cube", choices=sorted(SHAPES),
+                    help="which block to turn over")
+    ap.add_argument("--trigger", type=float, default=TRIGGER_N,
+                    help="newtons of block-on-table force that stops the descent")
+    ap.add_argument("--lift", type=float, default=LIFT_H,
+                    help="metres the pair raises the block before rolling it")
+    ap.add_argument("--roll", type=float, default=ROLL_DEG,
+                    help="degrees of roll commanded before the block is set down")
+    ap.add_argument("--descend-speed", type=float, default=DESCEND_SPEED,
+                    help="m/s the pair lowers the block at")
+    ap.add_argument("--attitude-frac", type=float, default=ATTITUDE_FRAC,
+                    help="how much of the roll the palms follow in attitude, 0..1")
+    ap.add_argument("--sweep-shape", action="store_true",
+                    help="every block through the same manoeuvre")
+    ap.add_argument("--sweep-lift", action="store_true",
+                    help="the outcome across lift heights, for the chosen block")
+    ap.add_argument("--sweep-trigger", action="store_true",
+                    help="the outcome across set-down trigger thresholds")
+    args = ap.parse_args()
+
+    if args.sweep_shape:
+        print("the same lift-and-roll against every block. 'tip' is atan(a/h), the tilt "
+              "past which\nthe block goes over on its own -- a push has to beat it too, "
+              "but on the arm's strength.\n'dropped' means the pinch lost it during the "
+              f"roll, before any set-down.  lift {args.lift*1000:.0f} mm\n")
+        print(f"  {'block':<7} {'size mm':>15} {'tip':>6} {'table':>6} {'carried':>8} "
+              f"{'at release':>11} {'face':>6} {'result':>9}")
+        for name in ("tall", "block", "cube", "wide", "low", "squat"):
+            r = build_and_run(name, args.trigger, args.lift, args.roll,
+                              args.descend_speed, args.attitude_frac)
+            half = r["half"]
+            dims = f"{half[0]*2000:.0f}x{half[0]*2000:.0f}x{half[1]*2000:.0f}"
+            out = ("dropped" if r["dropped"]
+                   else "TURNED" if verdict(r, r["table_top"]) else "failed")
+            print(f"  {name:<7} {dims:>15} {tip_deg(half):5.1f}d {r['table_top']:6.2f} "
+                  f"{r['carried']:7.1f}d {r['at_release']:10.1f}d {r['face1']:>6} "
+                  f"{out:>9}")
+        return 0
+
+    if args.sweep_lift:
+        print(f"lift height against the outcome, block '{args.shape}'. Every millimetre "
+              "lifted has to\nbe descended again, and the block rotates back inside the "
+              "grasp the whole way down --\nso 'carried' is measured at the top of the "
+              "descent and 'at release' at the bottom.\n")
+        print(f"  {'lift mm':>8} {'carried':>8} {'at release':>11} {'lost':>7} "
+              f"{'came to rest':>13} {'face':>6} {'result':>9}")
+        for lift in (0.04, 0.06, 0.08, 0.10, 0.15):
+            r = build_and_run(args.shape, args.trigger, lift, args.roll,
+                              args.descend_speed, args.attitude_frac)
+            out = ("dropped" if r["dropped"]
+                   else "TURNED" if verdict(r, r["table_top"]) else "failed")
+            print(f"  {lift*1000:8.0f} {r['carried']:7.1f}d {r['at_release']:10.1f}d "
+                  f"{r['carried'] - r['at_release']:6.1f}d {r['rolled']:12.1f}d "
+                  f"{r['face1']:>6} {out:>9}")
+        return 0
+
+    if args.sweep_trigger:
+        print(f"the outcome across set-down trigger thresholds, block '{args.shape}'.\n"
+              "Compare with rotate_around_x_axis_v3.py, where 10 microns of PLANNED "
+              "descent decides\nthe same question. The block weighs "
+              f"{BOX_MASS * 9.81:.1f} N.\n")
+        print(f"  {'trigger N':>10} {'froze at':>9} {'of descent':>11} {'at release':>11} "
+              f"{'came to rest':>13} {'face':>6} {'result':>9}")
+        for trig in (0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0):
+            r = build_and_run(args.shape, trig, args.lift, args.roll,
+                              args.descend_speed, args.attitude_frac)
+            froze = f"{r['froze_at']:.2f}s" if r["froze"] else "never"
+            print(f"  {trig:10.1f} {froze:>9} {r['froze_frac'] * 100:10.1f}% "
+                  f"{r['at_release']:10.1f}d {r['rolled']:12.1f}d {r['face1']:>6} "
+                  f"{'TURNED' if verdict(r, r['table_top']) else 'failed':>9}")
+        return 0
+
+    half = SHAPES[args.shape]
+    probe = build_scene(1.10, half)
+    drop = strip_drop_of(probe)
+    table_top = table_for(half, drop)
+    print(f"block '{args.shape}': {half[0]*2000:.0f} x {half[0]*2000:.0f} x "
+          f"{half[1]*2000:.0f} mm, {BOX_MASS} kg")
+    print(f"it tips over on its own past {tip_deg(half):.1f} deg -- the roll has to beat "
+          f"that, and carries about 65")
+    print(f"the palm's fingertip strip sits {-drop*1000:.0f} mm below the hand geom's "
+          f"centre, so gripping\n{GRIP_FRAC:.0%} of the way up this block puts the table "
+          f"at {table_top:.3f} m")
+
+    if not args.headless:
+        print("\nplanning (two passes: roll once to see where the corner ends up, then "
+              "the real run)")
+        r = build_and_run(args.shape, args.trigger, args.lift, args.roll,
+                          args.descend_speed, args.attitude_frac, verbose=True)
+        model, jm, poses, phases = r["model"], r["jm"], r["poses"], r["phases"]
+        print(f"\ncarried {r['carried']:.1f} deg of roll; lowest corner ended "
+              f"{r['gap']*1000:.0f} mm above the table")
+        print(f"descent planned to {r['descend']*1000:.0f} mm and stopped by contact at "
+              f"{r['froze_frac']*100:.0f}% of it")
+        print("\nleft-drag orbit | scroll zoom | Space pause | Esc quit\n")
+        data = mujoco.MjData(model)
+        data.qpos[jm.qadr] = poses["home"]
+        mujoco.mj_forward(model, data)
+        sd = SetDown(poses, phases, jm, model, args.trigger)
+        at = dict(phases)
+        with mujoco.viewer.launch_passive(model, data) as viewer:
+            wall = time.perf_counter()
+            while viewer.is_running():
+                tgt, _ = sd.target(data.time)
+                control(model, data, jm, tgt)
+                mujoco.mj_step(model, data)
+                if data.time >= at["hold"]:
+                    sd.note_contact(table_force(model, data), data.time,
+                                    sd.base(data.time))
+                viewer.sync()
+                lag = data.time - (time.perf_counter() - wall)
+                if lag > 0:
+                    time.sleep(lag)
+        return 0
+
+    log: list[tuple] = []
+    r = build_and_run(args.shape, args.trigger, args.lift, args.roll,
+                      args.descend_speed, args.attitude_frac, verbose=True, log=log)
+    print(f"\ncarried {r['carried']:.1f} deg of roll; lowest corner ended "
+          f"{r['gap']*1000:.0f} mm above the table, descent planned to "
+          f"{r['descend']*1000:.0f} mm")
+    print(f"\n{'t':>5} {'phase':<16} {'box z':>7} {'roll':>8} {'grip N':>8} "
+          f"{'table N':>8} {'hand pts':>9}")
+    for t, p, z, roll, f, tf, n in log:
+        print(f"{t:5.1f} {p:<16} {z:7.3f} {roll:7.1f}d {f:8.1f} {tf:8.1f} {n:9d}")
+
+    if r["froze"]:
+        print(f"\nthe descent stopped on contact at t={r['froze_at']:.2f}s, "
+              f"{r['froze_frac']*100:.0f}% of the planned {r['descend']*1000:.0f} mm -- "
+              f"the remaining {(1-r['froze_frac'])*r['descend']*1000:.0f} mm was never "
+              f"commanded")
+    else:
+        print("\nthe trigger NEVER FIRED: the descent ran to its planned depth")
+    print(f"block rose {(max(r['peak'], r['z0']) - r['z0'])*1000:.0f} mm above its start")
+    print(f"block was rolled {r['at_release']:.1f} deg when the hands came off (needed "
+          f"{tip_deg(r['half']):.1f}), and came to rest {r['rolled']:.1f} deg from where "
+          f"it started")
+    print(f"block now rests on its {r['face1']} face (started on {r['face0']}), "
+          f"{np.degrees(np.arccos(min(r['square'], 1.0))):.1f} deg off flat")
+    for label, ok in (("held all the way to the release, not dropped", not r["lost_grip"]),
+                      (f"past the {tip_deg(r['half']):.1f} deg tipping angle at release",
+                       abs(r["at_release"]) >= tip_deg(r["half"])),
+                      ("landed on a new face", r["face1"] != r["face0"]),
+                      ("lying flat, not propped on an edge", r["square"] > 0.999),
+                      ("left on the table, hands clear",
+                       r["z_end"] > r["table_top"] and r["held"] == 0)):
+        print(f"  [{'x' if ok else ' '}] {label}")
+    ok = verdict(r, r["table_top"])
+    print("RESULT:", "TURNED OVER AND PLACED" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
