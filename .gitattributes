@@ -1,0 +1,2 @@
+# p5_model.py verifies this file's sha256, so its bytes must not be converted on checkout
+magicbot_sim/p5_reference/*.urdf -text
