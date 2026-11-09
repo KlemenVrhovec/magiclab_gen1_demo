@@ -31,3 +31,6 @@ claude_code_prompt.md
 *.mp4
 *.png.tmp
 mjlog*
+
+# Scene exports (regenerate with magicbot_sim/export_scene.py)
+magicbot_sim/exports/
